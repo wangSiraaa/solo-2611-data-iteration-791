@@ -7,6 +7,7 @@ deliberately separate components:
 | --- | --- | --- |
 | Plan service | `exact_ledger/plan.py` | Plans, DAG validation, exact algebra, published per-output contracts. **Knows nothing about facts.** |
 | Replay warehouse | `exact_ledger/replay.py`, `exact_ledger/facts.py` | Fact versions, groups, import rules, eligibility, immutable results and provenance. **Consumes the published plan products.** |
+| Backtest samples | `exact_ledger/events.py`, `exact_ledger/samples.py` | Bitemporal measurement events (event time + first knowable time), cutoff-scoped version selection, immutable feature samples with per-event provenance. Separate tables; ordinary import and current-value reporting are unchanged. |
 
 `exact_ledger/rational.py` is the exact-rational layer: ints, `Fraction`, and
 string literals `"3"`, `"-3/4"`, `"0.125"`.  No float ever enters evaluation.
@@ -92,6 +93,70 @@ Evaluation is a sparse dot product over the reduced dependency map — the
 warehouse never “propagates UNKNOWN” through the original expression, so
 `(a+b)−b` with `b` missing is correctly a non-dependency, not “uncertain”.
 
+## Point-in-time feature samples (offline backtest)
+
+A correction that a reading received *later* must not leak into a prediction
+made *earlier*.  The bitemporal path therefore lives in two further modules
+that share the SQLite database but never touch the ordinary fact/result
+tables: `exact_ledger/events.py` (measurement event store) and
+`exact_ledger/samples.py` (sample builder).  `import_facts`, `effective()`,
+`inspect`/`publish` and every existing result keep their exact behaviour.
+
+A measurement event carries a stable `event_id`, a `device_id`, an integer
+hour `event_time`, a positive `revision`, the integer hour
+`knowable_time` (first hour *that revision* could be known), a sparse set of
+plan inputs, or an explicit `withdrawn` tombstone.  Ingestion rules:
+
+* `event_id` is permanently bound to one `(device_id, event_time)` pair;
+* revisions may arrive out of order — nothing is ever deleted, so a received
+  high revision cannot erase a low revision's historical visibility;
+* same `(event_id, revision)` + identical canonical content is an idempotent
+  replay; different content rejects the whole batch;
+* the knowable time is part of the canonical content, so a redelivery that
+  tries to move it conflicts instead of silently rewriting first visibility;
+* `knowable_time < event_time` and tombstones carrying inputs are rejected.
+
+```python
+from exact_ledger import open_sample_warehouse
+samples = open_sample_warehouse(plans)            # same path/connection OK
+samples.import_events(“pz”, events)               # atomic bitemporal batch
+sample = samples.build_sample({
+    “sample_id”: “s1”, “device_id”: “D”, “plan_id”: “pz”, “output”: “z”,
+    “prediction_time”: 11, “cutoff”: 11,         # C <= T, integer hours
+    “window_length”: 4, “min_events”: 2,
+})
+sample.status            # complete | insufficient_events | missing_inputs | ...
+sample.event_count       # surviving events in [T-L, T)
+sample.mean              # exact Fraction equal-weight mean (or None)
+samples.reopen(“s1”)     # immutable; later events never rewrite it
+sample.trace(“e2”)       # exact event_id / revision / knowable time / plan
+```
+
+Cutoff selection first restricts to revisions with `knowable_time <= C` and
+only then takes the highest revision; a selected tombstone means the
+measurement did not exist at that cutoff.  The window is half-open
+`[T−L, T)` — a reading at exactly `T` is excluded — and only the sample's
+own device participates.  The same event can serve several anchors through
+different revisions.
+
+The two failure modes stay separate.  `insufficient_events` means fewer than
+`m` surviving events (the honest mean of the fully evaluable events is still
+returned).  `missing_inputs` means a surviving event lacks an input in the
+output's reduced non-zero contract: that event is not skipped and the others
+are not averaged as if the window were complete, so **no mean is produced**
+and every missing `event_id`/`input`/`output` is recorded in `reasons` and
+in the per-event `sources`.  `build_samples([...])` validates a whole
+request atomically (duplicate or reused sample ids abort before anything is
+stored) while giving each sample its own status, sources and provenance.
+
+`python3.11 run_backtest.py` walks the worked numbers: e1 value 2 at hour 8,
+e2 value 5 (rev 1, knowable at 9) then 50 (rev 2, knowable at 12).  At
+`T=C=11, L=4, m=2` the mean is `7/2`; at `T=C=13, L=6` it is `26`; replaying
+the second anchor with `C=11` returns to `7/2`.  It also demonstrates
+out-of-order arrival, a high-version withdrawal leaving one survivor (and
+therefore an `insufficient_events` sample), independent devices, sparse
+inputs that block the mean, and old samples surviving later corrections.
+
 ## Scenario (materials/746)
 
 `python3.11 run_scenario.py` executes the input's operations and the prose
@@ -115,11 +180,14 @@ The original `p1` results stay at 4 throughout.
 python3.11 -m unittest discover -s tests -v
 ```
 
-52 tests cover exact rationals, DAG validation, zero-dependency elimination,
+102 tests cover exact rationals, DAG validation, zero-dependency elimination,
 shared-node algebra, cancellation explanation on a wide DAG, fact replay rules,
 per-output-set eligibility, immutable result identity, incremental recompute
-with group migration, persistence across connections, and a 50-node / 10-output
-/ 5000-fact run.
+with group migration, persistence across connections, a 50-node / 10-output
+/ 5000-fact run, bitemporal event ingestion (out-of-order arrival, identity
+binding, knowable-time conflicts, tombstones), cutoff-scoped window
+selection, every sample status and failure mode, sample immutability and
+provenance, and coexistence of the replay and sample paths in one database.
 
 ## Scale
 

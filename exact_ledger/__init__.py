@@ -60,12 +60,39 @@ from .replay import (
     UnknownOutputError,
     UnknownResultError,
 )
+from .events import (
+    EventConflictError,
+    EventError,
+    EventIdentityError,
+    EventStore,
+    InvalidEventError,
+    StoredEvent,
+    WindowedEvent,
+    event_content_hash,
+)
+from .samples import (
+    DuplicateSampleError,
+    InvalidSampleError,
+    REASON_NOT_KNOWABLE,
+    REASON_WITHDRAWN,
+    SAMPLE_COMPLETE,
+    SAMPLE_INSUFFICIENT,
+    SAMPLE_INSUFFICIENT_AND_MISSING_INPUTS,
+    SAMPLE_MISSING_INPUTS,
+    Sample,
+    SampleError,
+    SampleSource,
+    SampleSpec,
+    SampleWarehouse,
+    UnknownSampleError,
+)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "__version__",
     "open_warehouse",
+    "open_sample_warehouse",
     "open_connection",
     # rational
     "RationalError",
@@ -100,6 +127,30 @@ __all__ = [
     "InvalidFactError",
     "RevisionConflictError",
     "GroupMigrationError",
+    # bitemporal measurement events
+    "EventStore",
+    "StoredEvent",
+    "WindowedEvent",
+    "EventError",
+    "InvalidEventError",
+    "EventIdentityError",
+    "EventConflictError",
+    "event_content_hash",
+    # point-in-time feature samples
+    "SampleWarehouse",
+    "SampleSpec",
+    "Sample",
+    "SampleSource",
+    "SampleError",
+    "InvalidSampleError",
+    "DuplicateSampleError",
+    "UnknownSampleError",
+    "SAMPLE_COMPLETE",
+    "SAMPLE_INSUFFICIENT",
+    "SAMPLE_MISSING_INPUTS",
+    "SAMPLE_INSUFFICIENT_AND_MISSING_INPUTS",
+    "REASON_NOT_KNOWABLE",
+    "REASON_WITHDRAWN",
 ]
 
 
@@ -120,3 +171,19 @@ def open_warehouse(
     plans = plans or PlanService()
     connection = connection or open_connection(path)
     return ReplayWarehouse(connection, plans)
+
+
+def open_sample_warehouse(
+    plans: Optional[PlanService] = None,
+    connection: Optional[sqlite3.Connection] = None,
+    path: str = ":memory:",
+) -> SampleWarehouse:
+    """Convenience constructor for the point-in-time sample warehouse.
+
+    Passing the same ``connection`` (or file path) as a replay warehouse lets
+    both components share one database while keeping their tables and
+    ingestion paths fully separate.
+    """
+    plans = plans or PlanService()
+    connection = connection or open_connection(path)
+    return SampleWarehouse(connection, plans)
